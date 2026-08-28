@@ -249,6 +249,16 @@
             cursor: default;
         }
 
+        /* The focus ring is Vivaldi's global rule (common.css: :focus-visible),
+           and its specificity matches ours — so it is neutralised explicitly.
+           The bar is not keyboard-navigable (the button gives focus up on
+           mouseup), so no navigation cue is lost here. */
+        .${BTN_CLASS}:focus,
+        .${BTN_CLASS}:focus-visible {
+            outline: none;
+            box-shadow: none;
+        }
+
         /* [hidden] loses to the button's display: flex, hence the explicit rule */
         .${BTN_CLASS}[hidden] {
             display: none;
@@ -1080,8 +1090,13 @@
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = BTN_CLASS;
-        // Vivaldi draws a focus ring on toolbar buttons — it is out of place here
-        btn.addEventListener('focus', () => btn.blur());
+        // Vivaldi draws a focus ring on toolbar buttons — it is out of place here.
+        // The blur has to happen on mouseup, not on focus: blurring inside the
+        // focus that a mousedown produces aborts the drag Blink is about to
+        // start, so dragging a bar button only worked about one time in four.
+        // After a drop no mouseup is dispatched at all, so this cannot interfere
+        // with a drag; the ring itself is suppressed in STYLESHEET.
+        btn.addEventListener('mouseup', () => btn.blur());
         return btn;
     }
 
