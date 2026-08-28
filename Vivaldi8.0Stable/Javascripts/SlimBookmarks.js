@@ -48,7 +48,7 @@
     const TEXT_CLASS = 'is-text';               // display: titles only
     const ICONS_NF_CLASS = 'is-icons-no-folders';   // display: icons, except folders
     const FOLDER_BTN_CLASS = 'is-folder';       // marks a bar button that is a folder
-    const CHEVRON_CLASS = 'custom-bookmark-bar-chevron';   // step 3: the "the rest" button
+    const CHEVRON_CLASS = 'custom-bookmark-bar-chevron';   // the "the rest" button
 
     // When the user picks a custom folder for the bookmark bar, Vivaldi flags
     // it in Bookmarks with meta_info.Bookmarkbar = 'true'. It can sit at any
@@ -116,7 +116,6 @@
         maxBarWidth: 600,       // px, ceiling for the whole bar
         barLabelWidth: 105,     // px, ceiling for one bar button's title
         menuLabelWidth: 300,    // px, ceiling for one menu row's title
-        labelMinWidth: 24,      // px, floor a bar title shrinks to before "…"
         displayMode: 'vivaldi', // vivaldi | titleAndIcon | titleOnly | iconOnly | iconExceptFolders
         hoverDelay: 120,        // ms, hovering a folder opens its menu
         dragOpenDelay: 400,     // ms, hovering a folder while dragging opens it
@@ -130,7 +129,6 @@
         maxBarWidth: [120, 4000],
         barLabelWidth: [0, 600],
         menuLabelWidth: [80, 1200],
-        labelMinWidth: [0, 300],
         hoverDelay: [0, 5000],
         dragOpenDelay: [0, 10000],
     };
@@ -325,7 +323,7 @@
         if (onSettingsChanged) onSettingsChanged();
     });
 
-    // The display the bar starts from, before the shrinking ladder narrows it.
+    // The display mode every bar button is drawn in.
     function baseDisplayMode() {
         if (settings.displayMode !== 'vivaldi') return settings.displayMode;
         return VIVALDI_DISPLAY_MODES[barDisplayPref] || 'titleAndIcon';
@@ -401,8 +399,10 @@
             gap: 6px;
             padding: 0 6px;
             height: 22px;
-            flex: 0 1 auto;
-            min-width: 0;
+            /* flex: 0 0 auto — a button is always its natural width: a bar out
+               of room hides whole buttons (fitBar) instead of squeezing the
+               titles of the ones that stay */
+            flex: 0 0 auto;
             box-sizing: border-box;
             appearance: none;
             -webkit-appearance: none;
@@ -692,11 +692,13 @@
             text-align: left;
         }
 
-        /* Step 1: the label shrinks down to the floor, then "…".
-           Step 2: labels are dropped entirely, only icons remain. */
+        /* A bar title is never narrowed by a lack of room: its only limit is
+           the Bar Title Width setting (max-width, set inline by makeLabel),
+           and a title longer than that is cut with an ellipsis at every bar
+           width alike. Whatever no longer fits leaves the bar for the chevron
+           menu — see fitBar. */
         .${BAR_CLASS} .${MENU_CLASS}-label {
-            flex: 0 1 auto;
-            min-width: var(--sb-label-min, 24px);
+            flex: 0 0 auto;
         }
         .${BAR_CLASS}.${ICONS_CLASS} .${MENU_CLASS}-label {
             display: none;
@@ -704,9 +706,7 @@
 
         /* Display modes that Vivaldi's own bookmark bar offers, reproduced
            here (Settings > Bookmarks > Bookmark Bar > Display), plus the same
-           choices as explicit overrides in the mod's own settings.
-           "Icons only" is ICONS_CLASS above — it doubles as step 2 of the
-           shrinking ladder. */
+           choices as explicit overrides in the mod's own settings. */
         /* :not(chevron) — the overflow button is nothing but its icon, so
            hiding icons wholesale would leave an empty square at the end */
         .${BAR_CLASS}.${TEXT_CLASS} .${BTN_CLASS}:not(.${CHEVRON_CLASS}) .${ICON_CLASS} {
@@ -930,13 +930,12 @@
         let barFolderId = null; // id of the folder the bar was built from
         let barItems = [];      // children of the bar folder in their current order
 
-        // The two size settings the stylesheet needs. They are custom
-        // properties rather than a re-injected stylesheet: the sheet is shared
-        // by the bar and by every menu in the layer, and replacing it under an
-        // open menu would restart its transitions.
+        // The one size setting the stylesheet needs. It is a custom property
+        // rather than a re-injected stylesheet: the sheet is shared by the bar
+        // and by every menu in the layer, and replacing it under an open menu
+        // would restart its transitions.
         function applyBarVars() {
             bar.style.setProperty('--sb-max-bar-width', settings.maxBarWidth + 'px');
-            bar.style.setProperty('--sb-label-min', settings.labelMinWidth + 'px');
         }
 
         function render(items) {
@@ -1032,15 +1031,13 @@
             btn.classList.add(OPEN_CLASS);
         }
 
-        // The shrinking ladder. Step 1 (clipping labels) is entirely CSS; only
-        // step 2 lives here: once the minimums no longer fit, labels are dropped
-        // completely. The ladder is monotonic: we always try the fullest look
-        // first, otherwise the state would depend on history.
-        //
-        // The ladder starts from whatever display mode is in force rather than
-        // always from icon + title, and step 2 is skipped where it makes no
-        // sense: with titles only there is no icon left to recognise a button
-        // by, and with icons only there is no title left to drop.
+        // Fitting the bar into its ceiling. The only lever is which buttons
+        // stay: the ones that do not fit move under the chevron, from the end.
+        // Neither the display mode nor the title width is touched — both are
+        // the user's choice (ours or Vivaldi's own pref), so a button that
+        // stays on the bar looks exactly the same at every bar width.
+        // Monotonic: we always start from every button visible, otherwise the
+        // result would depend on history.
         let fitting = false;
         function fitBar() {
             if (fitting || !bar.isConnected) return;
@@ -1057,12 +1054,8 @@
             chevron.hidden = true;
             hiddenItems = [];
 
-            if (overflowing(bar) && (mode === 'titleAndIcon' || mode === 'iconExceptFolders')) {
-                bar.classList.remove(ICONS_NF_CLASS);
-                bar.classList.add(ICONS_CLASS);          // step 2: icons only
-            }
             if (overflowing(bar)) {
-                // step 3: whatever still does not fit moves under the chevron,
+                // whatever does not fit moves under the chevron,
                 // starting from the end
                 chevron.hidden = false;
                 for (let i = barButtons.length - 1; i >= 0; i--) {
@@ -1111,9 +1104,9 @@
             if (!bar.contains(e.relatedTarget)) clearDropFeedback();
         });
 
-        // Step 3: whatever did not fit even in icons-only mode moves into this
-        // button's menu. The button itself is never hidden and is not part of
-        // barButtons, otherwise fitBar could hide it too.
+        // Whatever did not fit on the bar moves into this button's menu. The
+        // button itself is never hidden and is not part of barButtons,
+        // otherwise fitBar could hide it too.
         let hiddenItems = [];   // items that did not fit into the bar
         const chevron = makeBarButton();
         chevron.classList.add(CHEVRON_CLASS);
@@ -1149,7 +1142,7 @@
         };
         rewatchParent();
         // after every re-insertion of the bar (leaving toolbar customization
-        // mode) we need both to recompute the shrinking ladder for the current
+        // mode) we need both to recompute which buttons fit for the current
         // size and to move the observation to the current parent — without that
         // the bar sticks in a state computed for the previous size until the
         // next "real" window resize
@@ -1273,7 +1266,7 @@
             // leaving the mode repaints the toolbar, and our insertion may be
             // wiped by the next render — hence a couple of extra attempts. After
             // every (including deferred) successful insertion, onInserted()
-            // recomputes the shrinking ladder and moves the ResizeObserver to the
+            // recomputes which buttons fit and moves the ResizeObserver to the
             // current parent — without that the bar stays in a state computed for
             // the previous size after leaving customization mode, until the user
             // touches the window manually
