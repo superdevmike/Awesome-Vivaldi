@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Slim Bookmarks
-// @description  Custom bookmark bar rendered inline in the address bar toolbar, with folder menus, drag & drop, context menu and edit dialog.
-// @version      2026.8.21
+// @description  Custom bookmark bar rendered inline in the address bar toolbar, with folder menus, drag & drop of bookmarks and folders, context menu, edit dialog and folder creation.
+// @version      2026.8.27
 // @author       superdevmike
 // ==/UserScript==
 
@@ -32,7 +32,6 @@
     // undo. Vivaldi's own menus never keep rows under the cursor — this
     // offset reproduces the same behaviour.
     const CTX_FLIP_MARGIN = 8;
-    const HOVER_DELAY = 120;
     const BTN_GAP = 2;          // gap between bar buttons
     const TRASH_ID = '4';       // the trash holds stale "Bookmarks Bar" folders
     // Vivaldi keeps menus at z-index 101 and dialogs at 1000..1002
@@ -44,26 +43,102 @@
     const DROP_LINE_CLASS = 'custom-bookmark-drop-line';
     const DROP_INTO_CLASS = 'is-drop-into';
     const EDGE_RATIO = 0.25;        // share of a button/row that means "insert next to"
-    const DRAG_OPEN_DELAY = 400;    // opening the folder under the cursor while dragging
-    const MAX_BAR_WIDTH = 600;  // bar width ceiling, px
-    const LABEL_MIN = 24;       // label width floor before falling back to icons, px
-    const ICONS_CLASS = 'is-icons';
+    const ICON_CLASS = MENU_CLASS + '-icon';    // shared by the favicon <img> and the fallback <svg>
+    const ICONS_CLASS = 'is-icons';             // display: icons only
+    const TEXT_CLASS = 'is-text';               // display: titles only
+    const ICONS_NF_CLASS = 'is-icons-no-folders';   // display: icons, except folders
+    const FOLDER_BTN_CLASS = 'is-folder';       // marks a bar button that is a folder
     const CHEVRON_CLASS = 'custom-bookmark-bar-chevron';   // step 3: the "the rest" button
 
     // When the user picks a custom folder for the bookmark bar, Vivaldi flags
     // it in Bookmarks with meta_info.Bookmarkbar = 'true'. It can sit at any
     // depth, not only in the root with id '1'.
-    // If auto-detection somehow fails, put the folder id here.
+    // If auto-detection somehow fails, put the folder id here (or, better,
+    // fill in "Bar Folder ID" in the mod's settings panel).
     const FORCE_FOLDER_ID = null;
 
-    // Vivaldi's "Open bookmarks in a new tab" setting. The path comes from
-    // prefs_definitions.json, type boolean, default value false.
+    // ------------------------------------------------------------------
+    // Vivaldi's own Bookmarks settings.
+    //
+    // Paths and types come from prefs_definitions.json. The mod deliberately
+    // follows the native settings instead of duplicating them: whatever the
+    // user has already configured for Vivaldi's own bookmark bar keeps working
+    // here. Everything read below is listed, in the same words, in the
+    // "Vivaldi Settings" note of the mod's ModConfig panel — keep the two in
+    // step when adding a pref.
+    //
+    //   open_in_new_tab   boolean   Settings > Bookmarks > Open Bookmark in New Tab
+    //   bar.display       enum      Settings > Bookmarks > Bookmark Bar > Display
+    //                               (default | text | icon | iconexceptfolders)
+    //   bar.folder_ids    list      Settings > Bookmarks > Bookmark Bar > Folder
+    //
+    // Not read, and why:
+    //   bar.visible / bar.position — our bar lives inside the address bar
+    //     toolbar, so Vivaldi's own bar placement says nothing about it.
+    //   confirm_opening, confirm_opening_threshold — they guard "Open All
+    //     Bookmarks", an action this mod's menus do not offer.
+    //   single_click_opens, bar.sorting — they belong to the bookmark manager
+    //     and the panel, not to the bar.
+    // ------------------------------------------------------------------
     const PREF_OPEN_NEW_TAB = 'vivaldi.bookmarks.open_in_new_tab';
+    const PREF_BAR_DISPLAY = 'vivaldi.bookmarks.bar.display';
+    const PREF_BAR_FOLDERS = 'vivaldi.bookmarks.bar.folder_ids';
+
+    // Vivaldi's enum -> our display modes
+    const VIVALDI_DISPLAY_MODES = {
+        default: 'titleAndIcon',
+        text: 'titleOnly',
+        icon: 'iconOnly',
+        iconexceptfolders: 'iconExceptFolders',
+    };
 
     // Not named openInNewTab: that is the name of the "Open in New Tab"
     // context menu action (see the "Context menu" section) — matching names
     // would collide as duplicate declarations.
     let openInNewTabPref = false;   // cached value of the Vivaldi setting
+    let barDisplayPref = 'default'; // cached vivaldi.bookmarks.bar.display
+    let barFolderIdsPref = [];      // cached vivaldi.bookmarks.bar.folder_ids
+
+    // ------------------------------------------------------------------
+    // Mod settings (ModConfig).
+    //
+    // The panel lives in vivaldi:settings/appearance -> Awesome Vivaldi ->
+    // Slim Bookmarks; the values are stored in OPFS under
+    // .askonpage/config.json, in mods.slimBookmarks. The defaults below are
+    // duplicated as defaultValue in MOD_SETTING_SCHEMAS.slimBookmarks
+    // (ModConfig.js) — the two lists must stay in step.
+    // ------------------------------------------------------------------
+    const MOD_CONFIG_KEY = 'slimBookmarks';
+    const MOD_CONFIG_DIR = '.askonpage';
+    const MOD_CONFIG_FILE = 'config.json';
+
+    const settings = {
+        maxBarWidth: 600,       // px, ceiling for the whole bar
+        barLabelWidth: 105,     // px, ceiling for one bar button's title
+        menuLabelWidth: 300,    // px, ceiling for one menu row's title
+        labelMinWidth: 24,      // px, floor a bar title shrinks to before "…"
+        displayMode: 'vivaldi', // vivaldi | titleAndIcon | titleOnly | iconOnly | iconExceptFolders
+        hoverDelay: 120,        // ms, hovering a folder opens its menu
+        dragOpenDelay: 400,     // ms, hovering a folder while dragging opens it
+        barFolderId: '',        // overrides the folder the bar is built from
+    };
+
+    // key -> [min, max]. Values are clamped rather than rejected: ModConfig's
+    // number inputs happily accept anything, and a bar with a 0 px ceiling
+    // would just silently vanish with no hint as to why.
+    const SETTING_LIMITS = {
+        maxBarWidth: [120, 4000],
+        barLabelWidth: [0, 600],
+        menuLabelWidth: [80, 1200],
+        labelMinWidth: [0, 300],
+        hoverDelay: [0, 5000],
+        dragOpenDelay: [0, 10000],
+    };
+    const DISPLAY_MODES = ['vivaldi', 'titleAndIcon', 'titleOnly', 'iconOnly', 'iconExceptFolders'];
+
+    // Set by createBookmarkBar once the bar exists. The config may arrive
+    // either before or after that — this is the single place both paths meet.
+    let onSettingsChanged = null;
 
     let attempts = 0;
     const timer = setInterval(() => {
@@ -94,10 +169,10 @@
     }, 300);
 
     // ------------------------------------------------------------------
-    // Settings
+    // Vivaldi settings
     // ------------------------------------------------------------------
     // Some builds return the value itself, others an object {path, value}
-    const unwrapPref = (v) => !!(v && typeof v === 'object' && 'value' in v ? v.value : v);
+    const unwrapPref = (v) => (v && typeof v === 'object' && 'value' in v ? v.value : v);
 
     function prefsApi() {
         try {
@@ -108,60 +183,152 @@
         }
     }
 
-    // Re-reads the setting and calls done() — on success, on failure and when
-    // the API stays silent. Nothing here may get in the way of opening a bookmark.
-    function readOpenInNewTab(done) {
+    // Reads one pref, hands the raw value to apply(), and calls done() — on
+    // success, on failure and when the API stays silent alike. done() is what
+    // openBookmark waits on, so it must never be left hanging; apply(), on the
+    // other hand, only runs when there really is a value, so a failure simply
+    // leaves the last known one in place.
+    function readPref(path, apply, done) {
+        const finishOnce = (() => {
+            let settled = false;
+            return () => { if (!settled) { settled = true; (done || (() => {}))(); } };
+        })();
+
         const prefs = prefsApi();
-        if (!prefs) { done(); return; }
+        if (!prefs) { finishOnce(); return; }
 
-        let settled = false;
-        const finish = () => { if (!settled) { settled = true; done(); } };
-
-        const apply = (value) => {
+        const receive = (value) => {
             if (chrome.runtime.lastError) {
-                console.warn('[SlimBookmarks] could not read', PREF_OPEN_NEW_TAB, chrome.runtime.lastError.message);
+                console.warn('[SlimBookmarks] could not read', path, chrome.runtime.lastError.message);
             } else {
-                openInNewTabPref = unwrapPref(value);
+                apply(unwrapPref(value));
             }
-            finish();
+            finishOnce();
         };
 
-        // if no answer arrives — open the bookmark using the last known value
-        setTimeout(finish, 400);
+        // if no answer arrives — carry on with the last known value
+        setTimeout(finishOnce, 400);
 
         try {
             // the prefs.get signature differs between builds: some take an
             // object {path}, some a plain string — try both
             try {
-                prefs.get({ path: PREF_OPEN_NEW_TAB }, apply);
+                prefs.get({ path }, receive);
             } catch {
-                prefs.get(PREF_OPEN_NEW_TAB, apply);
+                prefs.get(path, receive);
             }
         } catch (err) {
             console.warn('[SlimBookmarks] reading the setting failed:', err);
-            finish();
+            finishOnce();
         }
     }
 
-    // Nothing here may break the bar: on any error we stay with the default
-    // value (openInNewTabPref = false) and log to the console.
+    // Re-reads the setting and calls done() in every case. Nothing here may get
+    // in the way of opening a bookmark.
+    function readOpenInNewTab(done) {
+        readPref(PREF_OPEN_NEW_TAB, (value) => { openInNewTabPref = !!value; }, done);
+    }
+
+    // The two prefs that shape the bar itself. Unlike open_in_new_tab they gate
+    // no user action, so there is nothing to wait for — whatever arrives is
+    // applied through onSettingsChanged, exactly like a ModConfig change.
+    function readBarPrefs() {
+        readPref(PREF_BAR_DISPLAY, (value) => {
+            const mode = String(value || '').toLowerCase();
+            // onChanged fires for every pref in Vivaldi, not just ours, so the
+            // bar is rebuilt only when the value really moved — otherwise any
+            // unrelated setting would close the menu the user has open
+            if (!VIVALDI_DISPLAY_MODES[mode] || mode === barDisplayPref) return;
+            barDisplayPref = mode;
+            if (onSettingsChanged) onSettingsChanged();
+        });
+        readPref(PREF_BAR_FOLDERS, (value) => {
+            if (!Array.isArray(value)) return;
+            const ids = value.map(String).filter(Boolean);
+            // the bar is rebuilt only when the choice actually changed: a
+            // pointless reload closes whatever menu the user has open
+            if (ids.join(',') === barFolderIdsPref.join(',')) return;
+            barFolderIdsPref = ids;
+            if (onSettingsChanged) onSettingsChanged();
+        });
+    }
+
+    // Nothing here may break the bar: on any error we stay with the defaults
+    // and log to the console.
     function watchVivaldiPrefs() {
         try {
             if (!prefsApi()) {
-                console.warn('[SlimBookmarks] vivaldi.prefs unavailable — the "Open bookmarks in a new tab" setting is not read');
+                console.warn('[SlimBookmarks] vivaldi.prefs unavailable — Vivaldi\'s own Bookmarks settings are not read');
                 return;
             }
 
             readOpenInNewTab(() => {
                 console.log('⚙️ [SlimBookmarks] Open in a new tab:', openInNewTabPref);
             });
+            readBarPrefs();
 
             // The onChanged payload shape differs between builds, so we do not
             // parse it at all — any change simply triggers a re-read.
-            prefsApi().onChanged?.addListener?.(() => readOpenInNewTab(() => {}));
+            prefsApi().onChanged?.addListener?.(() => {
+                readOpenInNewTab(() => {});
+                readBarPrefs();
+            });
         } catch (err) {
             console.warn('[SlimBookmarks] subscribing to settings failed:', err);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Mod settings (ModConfig)
+    //
+    // The same contract every other mod in the pack follows: read
+    // .askonpage/config.json out of OPFS once at startup, then listen for
+    // ModConfig's broadcast. A missing file is the normal case — the user has
+    // simply never opened the panel — so it is not an error.
+    // ------------------------------------------------------------------
+    function applyModConfig(raw) {
+        const source = raw?.mods?.[MOD_CONFIG_KEY] && typeof raw.mods[MOD_CONFIG_KEY] === 'object'
+            ? raw.mods[MOD_CONFIG_KEY]
+            : {};
+
+        Object.keys(SETTING_LIMITS).forEach((key) => {
+            const value = Number(source[key]);
+            if (!Number.isFinite(value)) return;
+            const [min, max] = SETTING_LIMITS[key];
+            settings[key] = clamp(value, min, max);
+        });
+        if (DISPLAY_MODES.includes(source.displayMode)) {
+            settings.displayMode = source.displayMode;
+        }
+        if (typeof source.barFolderId === 'string') {
+            settings.barFolderId = source.barFolderId.trim();
+        }
+    }
+
+    async function loadModConfig() {
+        try {
+            const root = await navigator.storage.getDirectory();
+            const dir = await root.getDirectoryHandle(MOD_CONFIG_DIR, { create: true });
+            const fileHandle = await dir.getFileHandle(MOD_CONFIG_FILE, { create: false });
+            const file = await fileHandle.getFile();
+            applyModConfig(JSON.parse(await file.text()));
+        } catch (err) {
+            console.warn('[SlimBookmarks] mod config not loaded, using defaults:', err);
+        }
+    }
+
+    // The config load races the bar's own construction; whichever finishes
+    // second finds the other side ready through onSettingsChanged.
+    loadModConfig().then(() => { if (onSettingsChanged) onSettingsChanged(); });
+    window.addEventListener('vivaldi-mod-config-updated', (event) => {
+        applyModConfig(event.detail || {});
+        if (onSettingsChanged) onSettingsChanged();
+    });
+
+    // The display the bar starts from, before the shrinking ladder narrows it.
+    function baseDisplayMode() {
+        if (settings.displayMode !== 'vivaldi') return settings.displayMode;
+        return VIVALDI_DISPLAY_MODES[barDisplayPref] || 'titleAndIcon';
     }
 
     // ------------------------------------------------------------------
@@ -218,7 +385,9 @@
                yields room to the address field instead of squeezing it out */
             flex: 0 1 auto;
             min-width: 0;
-            max-width: ${MAX_BAR_WIDTH}px;
+            /* the fallbacks are only for the split second before
+               applyBarVars() runs — the real values come from the settings */
+            max-width: var(--sb-max-bar-width, 600px);
             overflow: hidden;
             /* same as the native .bookmark-bar */
             font-size: 11.5px;
@@ -523,13 +692,27 @@
             text-align: left;
         }
 
-        /* Step 1: the label shrinks down to LABEL_MIN, then "…".
+        /* Step 1: the label shrinks down to the floor, then "…".
            Step 2: labels are dropped entirely, only icons remain. */
         .${BAR_CLASS} .${MENU_CLASS}-label {
             flex: 0 1 auto;
-            min-width: ${LABEL_MIN}px;
+            min-width: var(--sb-label-min, 24px);
         }
         .${BAR_CLASS}.${ICONS_CLASS} .${MENU_CLASS}-label {
+            display: none;
+        }
+
+        /* Display modes that Vivaldi's own bookmark bar offers, reproduced
+           here (Settings > Bookmarks > Bookmark Bar > Display), plus the same
+           choices as explicit overrides in the mod's own settings.
+           "Icons only" is ICONS_CLASS above — it doubles as step 2 of the
+           shrinking ladder. */
+        /* :not(chevron) — the overflow button is nothing but its icon, so
+           hiding icons wholesale would leave an empty square at the end */
+        .${BAR_CLASS}.${TEXT_CLASS} .${BTN_CLASS}:not(.${CHEVRON_CLASS}) .${ICON_CLASS} {
+            display: none;
+        }
+        .${BAR_CLASS}.${ICONS_NF_CLASS} .${BTN_CLASS}:not(.${FOLDER_BTN_CLASS}) .${MENU_CLASS}-label {
             display: none;
         }
 
@@ -697,6 +880,17 @@
     let hoverTimer = null;
     let activeBarBtn = null;
 
+    // A menu holding a live drag source is never closed: removing the node the
+    // drag started from kills the drag, and the user is left holding nothing.
+    // The loop stops at that menu rather than skipping it — the menus above it
+    // are its own submenus, and closing those while keeping this one would
+    // leave the stack inconsistent.
+    // Deliberately unconditional, including while a drag is in flight. Closing
+    // the menu a drag started from does not cancel that drag — Blink captured
+    // the payload at dragstart and the session outlives the source node — and
+    // the folder that auto-opens under a dragged item comes through
+    // openBarMenu(), which closes the whole stack first. An exception for the
+    // drag source here made that opened folder refuse every drop.
     function closeFrom(depth) {
         while (openMenus.length > depth) {
             const menu = openMenus.pop();
@@ -709,8 +903,13 @@
         }
     }
 
+    // Closes the menus and nothing else. It must stay drag-neutral: dragging an
+    // item onto a bar folder auto-opens that folder through openBarMenu(),
+    // which starts here — ending the drag at that point left the folder open
+    // but inert, with no insertion line and no drop.
     function closeAll() {
         clearTimeout(hoverTimer);
+        highlightBg = null;     // the theme may have changed between sessions
         closeFrom(0);
     }
 
@@ -731,6 +930,15 @@
         let barFolderId = null; // id of the folder the bar was built from
         let barItems = [];      // children of the bar folder in their current order
 
+        // The two size settings the stylesheet needs. They are custom
+        // properties rather than a re-injected stylesheet: the sheet is shared
+        // by the bar and by every menu in the layer, and replacing it under an
+        // open menu would restart its transitions.
+        function applyBarVars() {
+            bar.style.setProperty('--sb-max-bar-width', settings.maxBarWidth + 'px');
+            bar.style.setProperty('--sb-label-min', settings.labelMinWidth + 'px');
+        }
+
         function render(items) {
             // rebuilding the bar pulls every button out of the tree, including
             // the ones a current drag may be bound to (the source and/or the
@@ -747,14 +955,14 @@
                 const btn = makeBarButton();
                 const isFolder = !item.url;
 
-                btn.append(makeIcon(item), makeLabel(item, 105));
+                btn.append(makeIcon(item), makeLabel(item, settings.barLabelWidth));
                 btn.title = tooltipOf(item);
                 btn._node = item;   // the node is needed by the context menu and by dragging
                 btn.addEventListener('contextmenu', (e) => {
                     // without preventDefault the toolbar menu shows up over ours
                     e.preventDefault();
                     e.stopPropagation();
-                    showContextMenu(item, e.clientX, e.clientY, 0);
+                    showContextMenu({ node: item, parentId: barFolderId }, e.clientX, e.clientY, 0);
                 });
                 makeDraggable(btn, item);
                 makeDropTarget(btn, {
@@ -767,6 +975,8 @@
                 });
 
                 if (isFolder) {
+                    // the marker the "icons except folders" display mode selects on
+                    btn.classList.add(FOLDER_BTN_CLASS);
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         clearTimeout(hoverTimer);
@@ -775,12 +985,12 @@
                         openBarMenu(btn, item.children || [], item.id);
                     });
                     btn.addEventListener('mouseenter', () => {
-                        if (ctxMenu) return;    // the context menu keeps focus on itself
+                        if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                         // if a menu is already open — hovering switches the
                         // folder, as in the native bookmark bar
                         if (!openMenus.length || activeBarBtn === btn) return;
                         clearTimeout(hoverTimer);
-                        hoverTimer = setTimeout(() => openBarMenu(btn, item.children || [], item.id), HOVER_DELAY);
+                        hoverTimer = setTimeout(() => openBarMenu(btn, item.children || [], item.id), settings.hoverDelay);
                     });
                 } else {
                     btn.addEventListener('click', (e) => {
@@ -796,10 +1006,10 @@
                         closeAll();
                     });
                     btn.addEventListener('mouseenter', () => {
-                        if (ctxMenu) return;    // the context menu keeps focus on itself
+                        if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                         if (!openMenus.length) return;
                         clearTimeout(hoverTimer);
-                        hoverTimer = setTimeout(closeAll, HOVER_DELAY);
+                        hoverTimer = setTimeout(closeAll, settings.hoverDelay);
                     });
                 }
 
@@ -826,6 +1036,11 @@
         // step 2 lives here: once the minimums no longer fit, labels are dropped
         // completely. The ladder is monotonic: we always try the fullest look
         // first, otherwise the state would depend on history.
+        //
+        // The ladder starts from whatever display mode is in force rather than
+        // always from icon + title, and step 2 is skipped where it makes no
+        // sense: with titles only there is no icon left to recognise a button
+        // by, and with icons only there is no title left to drop.
         let fitting = false;
         function fitBar() {
             if (fitting || !bar.isConnected) return;
@@ -833,12 +1048,17 @@
 
             // always start from the fullest look — otherwise the result would
             // depend on what had been hidden earlier
-            bar.classList.remove(ICONS_CLASS);
+            const mode = baseDisplayMode();
+            bar.classList.remove(ICONS_CLASS, TEXT_CLASS, ICONS_NF_CLASS);
+            if (mode === 'titleOnly') bar.classList.add(TEXT_CLASS);
+            if (mode === 'iconOnly') bar.classList.add(ICONS_CLASS);
+            if (mode === 'iconExceptFolders') bar.classList.add(ICONS_NF_CLASS);
             barButtons.forEach((btn) => { btn.hidden = false; });
             chevron.hidden = true;
             hiddenItems = [];
 
-            if (overflowing(bar)) {
+            if (overflowing(bar) && (mode === 'titleAndIcon' || mode === 'iconExceptFolders')) {
+                bar.classList.remove(ICONS_NF_CLASS);
                 bar.classList.add(ICONS_CLASS);          // step 2: icons only
             }
             if (overflowing(bar)) {
@@ -854,6 +1074,17 @@
 
             fitting = false;
         }
+
+        // A right click on the free space between/after the buttons = the
+        // context menu of the bar folder itself, so that a new folder can be
+        // added to the top level of the bar. An event from a button never
+        // reaches here: there is a stopPropagation over there.
+        bar.addEventListener('contextmenu', (e) => {
+            if (!barFolderId) return;   // no folder resolved yet -> leave the native menu alone
+            e.preventDefault();
+            e.stopPropagation();
+            showContextMenu({ node: null, parentId: barFolderId }, e.clientX, e.clientY, 0);
+        });
 
         // A drop on the free space to the right of the buttons = to the end of
         // the bar folder. An event from a button never reaches here: there is a
@@ -895,10 +1126,10 @@
             openBarMenu(chevron, hiddenItems, barFolderId);
         });
         chevron.addEventListener('mouseenter', () => {
-            if (ctxMenu) return;
+            if (ctxMenu || dragNode) return;
             if (!openMenus.length || activeBarBtn === chevron) return;
             clearTimeout(hoverTimer);
-            hoverTimer = setTimeout(() => openBarMenu(chevron, hiddenItems, barFolderId), HOVER_DELAY);
+            hoverTimer = setTimeout(() => openBarMenu(chevron, hiddenItems, barFolderId), settings.hoverDelay);
         });
         bar.appendChild(chevron);
 
@@ -950,7 +1181,19 @@
             vivaldi.bookmarksPrivate?.onMetaInfoChanged?.addListener(scheduleReload);
         }
 
+        applyBarVars();
         load();
+
+        // Settings changed — from ModConfig or from Vivaldi's own Bookmarks
+        // page. A full reload rather than a targeted update: the label widths
+        // are baked into the buttons at build time, and the folder the bar is
+        // built from may have changed too. Open menus go first — they were
+        // built against the old widths.
+        onSettingsChanged = () => {
+            applyBarVars();
+            closeAll();
+            load();
+        };
 
         // --- global closing ---
         document.addEventListener('click', (e) => {
@@ -970,6 +1213,8 @@
         }, true);
         document.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') return;
+            // the one place a drag really is being cancelled by the user
+            endDrag();
             closeAll();
             closeEditDialog();
         });
@@ -1068,18 +1313,36 @@
 
     function resolveBarFolder(tree) {
         const roots = (tree[0]?.children || []).filter(r => r.id !== TRASH_ID);
-
-        if (FORCE_FOLDER_ID != null) {
+        const findById = (id) => {
             for (const root of roots) {
-                const forced = findNode(root, n => n.id === String(FORCE_FOLDER_ID));
-                if (forced) return forced;
+                const hit = findNode(root, n => n.id === String(id));
+                if (hit) return hit;
             }
-            console.warn('[SlimBookmarks] FORCE_FOLDER_ID not found:', FORCE_FOLDER_ID);
+            return null;
+        };
+
+        // the explicit override wins over everything: it exists precisely for
+        // the case where the two automatic sources below get it wrong
+        const forcedId = String(settings.barFolderId || FORCE_FOLDER_ID || '').trim();
+        if (forcedId) {
+            const forced = findById(forcedId);
+            if (forced) return forced;
+            console.warn('[SlimBookmarks] Bar Folder ID not found:', forcedId);
         }
 
         for (const root of roots) {
             const flagged = findNode(root, isBarFolder);
             if (flagged) return flagged;
+        }
+
+        // Vivaldi's own "Bookmark Bar folder" setting. meta_info comes first
+        // because that is what Vivaldi writes when the folder is picked from
+        // the bar itself; the pref is the same choice as stored in settings,
+        // and it is the only source left when the tree snapshot this build
+        // hands us carries no meta_info at all.
+        for (const id of barFolderIdsPref) {
+            const picked = findById(id);
+            if (picked) return picked;
         }
 
         // no custom folder picked — the stock bookmark bar (id '1')
@@ -1106,8 +1369,18 @@
     // theme's grey background, with the text keeping its own colour. The accent
     // --colorHighlightBg is reserved there for the item selected with the
     // keyboard (selectedItem), not for the one under the cursor.
+    // getComputedStyle(#browser) forces a style recalculation of Vivaldi's whole
+    // UI tree, and this is called from mousemove — so it used to run on every
+    // single pointer movement across a menu. The colour cannot change while a
+    // menu is open, so it is read once per menu session and dropped in
+    // closeAll(), where the next session begins.
+    let highlightBg = null;
+
     function rowHighlightColors() {
-        return { bg: getComputedStyle(layerHost()).getPropertyValue('--colorBgDark').trim(), fg: '' };
+        if (highlightBg === null) {
+            highlightBg = getComputedStyle(layerHost()).getPropertyValue('--colorBgDark').trim();
+        }
+        return { bg: highlightBg, fg: '' };
     }
 
     // The highlight is written straight into the element's style, not only as a
@@ -1144,7 +1417,6 @@
     // Icons and labels
     // ------------------------------------------------------------------
     const ICON_SIZE = 16;
-    const ICON_CLASS = MENU_CLASS + '-icon';
 
     function svgIcon(pathD) {
         const ns = 'http://www.w3.org/2000/svg';
@@ -1245,13 +1517,13 @@
             const row = makeMenuRow();
 
             const isFolder = !item.url;
-            row.append(makeIcon(item), makeLabel(item, 300));
+            row.append(makeIcon(item), makeLabel(item, settings.menuLabelWidth));
             row.title = item.url || titleOf(item);
             row.addEventListener('contextmenu', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 // depth + 1: the menu holding the row stays open
-                showContextMenu(item, e.clientX, e.clientY, depth + 1);
+                showContextMenu({ node: item, parentId: folderId }, e.clientX, e.clientY, depth + 1);
             });
 
             // openSub is declared below, inside the isFolder branch, but dragging
@@ -1279,10 +1551,10 @@
                 openSubForDrag = openSub;
 
                 row.onmouseenter = () => {
-                    if (ctxMenu) return;    // the context menu keeps focus on itself
+                    if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                     setRowActive(row, true);
                     clearTimeout(hoverTimer);
-                    hoverTimer = setTimeout(openSub, HOVER_DELAY);
+                    hoverTimer = setTimeout(openSub, settings.hoverDelay);
                 };
                 row.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -1291,11 +1563,11 @@
                 });
             } else {
                 row.onmouseenter = () => {
-                    if (ctxMenu) return;    // the context menu keeps focus on itself
+                    if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                     setRowActive(row, true);
                     clearTimeout(hoverTimer);
                     // hovering a bookmark -> close the neighbouring folder's submenu
-                    hoverTimer = setTimeout(() => closeFrom(depth + 1), HOVER_DELAY);
+                    hoverTimer = setTimeout(() => closeFrom(depth + 1), settings.hoverDelay);
                 };
                 row.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -1319,6 +1591,18 @@
             });
 
             menu.appendChild(row);
+        });
+
+        // A right click past the rows (an empty folder, or the space below the
+        // last row) = the context menu of this folder itself. This is the only
+        // way into a folder that has nothing in it yet: there is no row to aim
+        // at. Rows stop propagation in their own handler, so only events from
+        // the menu's background get here.
+        menu.addEventListener('contextmenu', (e) => {
+            if (!folderId) return;
+            e.preventDefault();
+            e.stopPropagation();
+            showContextMenu({ node: null, parentId: folderId }, e.clientX, e.clientY, depth + 1);
         });
 
         // A drop past the rows (an empty folder, or the space below the last row)
@@ -1397,6 +1681,8 @@
     function buildLabels() {
         return {
             edit: label('Edit', 'command', 'Edit'),
+            addFolder: label('Add Folder', null, 'Add Folder'),
+            newFolder: label('New Folder', 'command', 'New Folder'),
             remove: label('Delete', 'verb', 'Delete'),
             // Vivaldi's locale has no strings for our own dialog's fields —
             // the native edit dialog lives in a React store and is unreachable.
@@ -1411,25 +1697,52 @@
 
     let ctxMenu = null;     // the open context menu, if any
 
-    // The contents are the same for a bookmark and a folder: the difference is
-    // only inside the edit dialog (a folder has no URL field).
-    function contextItems(node) {
+    // target = { node, parentId }: the node that was right clicked (null for a
+    // click on the bar's or a menu's background) and the folder that node —
+    // or that background — belongs to.
+    //
+    // Edit and Delete are the same for a bookmark and a folder: the difference
+    // is only inside the edit dialog (a folder has no URL field). Add Folder is
+    // the one entry that reads the click position, so that the new folder lands
+    // where the user pointed:
+    //   right click on a folder   -> a subfolder inside it (at its end)
+    //   right click on a bookmark -> a folder next to it, in the same folder
+    //   right click on background -> at the end of the folder that background
+    //                                shows (the bar folder, or the open menu's)
+    function contextItems(target) {
         const LABELS = buildLabels();
-        return [
-            { label: LABELS.edit, run: () => showEditDialog(node) },
-            null,
-            { label: LABELS.remove, run: () => removeNode(node) },
-        ];
+        const node = target.node;
+        const intoNode = node && !node.url;      // a folder takes the new folder inside itself
+
+        const addFolder = (intoNode || target.parentId)
+            ? {
+                label: LABELS.addFolder,
+                // afterId is null for "at the end": a subfolder goes to the end
+                // of its new parent, a sibling goes right after the clicked node
+                run: () => showNewFolderDialog(intoNode ? node.id : target.parentId,
+                                               intoNode ? null : (node ? node.id : null)),
+            }
+            : null;
+
+        // background click — nothing to edit or delete, only the one entry
+        if (!node) return addFolder ? [addFolder] : [];
+
+        const items = [{ label: LABELS.edit, run: () => showEditDialog(node) }];
+        if (addFolder) items.push(addFolder);
+        items.push(null, { label: LABELS.remove, run: () => removeNode(node) });
+        return items;
     }
 
     // keepDepth — how many already open menus to keep: 0 for a bar button,
     // depth + 1 for a menu row (the row itself must stay on screen).
-    function showContextMenu(node, x, y, keepDepth) {
+    function showContextMenu(target, x, y, keepDepth) {
+        const items = contextItems(target);
+        if (!items.length) return;
         closeFrom(keepDepth);
         clearTimeout(hoverTimer);
 
         const menu = makeMenuShell(CTX_DEPTH);
-        contextItems(node).forEach((item) => {
+        items.forEach((item) => {
             if (!item) {
                 const sep = document.createElement('div');
                 sep.className = SEP_CLASS;
@@ -1486,6 +1799,26 @@
         else chrome.bookmarks.removeTree(node.id, reportError);
     }
 
+    // afterId — the node the new folder must follow, or null for "at the end".
+    // The index is resolved here rather than taken from the tree snapshot the
+    // bar was rendered from: between the right click and the Save button the
+    // folder may well have been reordered from elsewhere, and an index that no
+    // longer fits its parent makes chrome.bookmarks.create fail outright.
+    function createFolder(parentId, afterId, title) {
+        if (!afterId) {
+            chrome.bookmarks.create({ parentId, title }, reportError);
+            return;
+        }
+        chrome.bookmarks.getChildren(parentId, (children) => {
+            if (chrome.runtime.lastError) { reportError(); return; }
+            const at = (children || []).findIndex(c => c.id === afterId);
+            const details = { parentId, title };
+            // the sibling is gone — fall back to the end of the folder
+            if (at >= 0) details.index = at + 1;
+            chrome.bookmarks.create(details, reportError);
+        });
+    }
+
     // ------------------------------------------------------------------
     // Edit dialog.
     //
@@ -1502,24 +1835,30 @@
         editDialog = null;
     }
 
-    function showEditDialog(node) {
+    // The shell shared by editing and by creating a folder: both are a heading,
+    // a text field or two, and a Save/Cancel pair — only what Save does differs.
+    // onApply receives the field values in the order they were declared.
+    function showDialog(heading, fieldSpecs, onApply) {
         closeAll();
         closeEditDialog();
 
         const LABELS = buildLabels();
-        const isFolder = !node.url;
 
         const overlay = document.createElement('div');
         overlay.className = DIALOG_CLASS;
         const box = document.createElement('div');
         box.className = DIALOG_CLASS + '-box';
 
-        const heading = document.createElement('div');
-        heading.className = DIALOG_CLASS + '-heading';
-        heading.textContent = isFolder ? LABELS.editFolderTitle : LABELS.editBookmarkTitle;
+        const headingEl = document.createElement('div');
+        headingEl.className = DIALOG_CLASS + '-heading';
+        headingEl.textContent = heading;
+        box.appendChild(headingEl);
 
-        const nameField = makeDialogField(LABELS.fieldName, node.title || '');
-        const urlField = isFolder ? null : makeDialogField(LABELS.fieldUrl, node.url || '');
+        const fields = fieldSpecs.map((spec) => {
+            const field = makeDialogField(spec.label, spec.value || '');
+            box.appendChild(field.row);
+            return field;
+        });
 
         const buttons = document.createElement('div');
         buttons.className = DIALOG_CLASS + '-buttons';
@@ -1527,19 +1866,15 @@
         const save = makeDialogButton(LABELS.save, true);
         buttons.append(cancel, save);
 
-        box.append(heading, nameField.row);
-        if (urlField) box.appendChild(urlField.row);
         box.appendChild(buttons);
         overlay.appendChild(box);
         getLayer().appendChild(overlay);
         editDialog = overlay;
 
         const apply = () => {
-            const changes = { title: nameField.input.value };
-            // an empty URL is not saved: a node without a url would turn into a folder
-            if (urlField && urlField.input.value.trim()) changes.url = urlField.input.value.trim();
+            const values = fields.map(f => f.input.value);
             closeEditDialog();
-            chrome.bookmarks.update(node.id, changes, reportError);
+            onApply(values);
         };
 
         save.addEventListener('click', apply);
@@ -1551,8 +1886,32 @@
             if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeEditDialog(); }
         });
 
-        nameField.input.focus();
-        nameField.input.select();
+        fields[0]?.input.focus();
+        fields[0]?.input.select();
+    }
+
+    function showEditDialog(node) {
+        const LABELS = buildLabels();
+        const isFolder = !node.url;
+
+        const specs = [{ label: LABELS.fieldName, value: node.title || '' }];
+        if (!isFolder) specs.push({ label: LABELS.fieldUrl, value: node.url || '' });
+
+        showDialog(isFolder ? LABELS.editFolderTitle : LABELS.editBookmarkTitle, specs, (values) => {
+            const changes = { title: values[0] };
+            // an empty URL is not saved: a node without a url would turn into a folder
+            if (!isFolder && values[1].trim()) changes.url = values[1].trim();
+            chrome.bookmarks.update(node.id, changes, reportError);
+        });
+    }
+
+    // The name is pre-filled with Vivaldi's own "New Folder" and selected, so
+    // that Enter alone is enough to get the same result as the native menu.
+    function showNewFolderDialog(parentId, afterId) {
+        const LABELS = buildLabels();
+        showDialog(LABELS.newFolder, [{ label: LABELS.fieldName, value: LABELS.newFolder }], (values) => {
+            createFolder(parentId, afterId, values[0].trim() || LABELS.newFolder);
+        });
     }
 
     function makeDialogField(labelText, value) {
@@ -1601,18 +1960,45 @@
 
     function makeDraggable(el, node) {
         el.draggable = true;
+        // Between the press and the first move Blink is still deciding whether
+        // this gesture becomes a drag, and it resolves the drag source by hit
+        // testing. A menu that opens in that window lands on top of the element
+        // under the cursor and the gesture is dropped — the press ends up doing
+        // nothing at all. So the pending hover timer dies with the press: this
+        // is the same class of bug as the focus ring blur that used to abort
+        // drags on bar buttons.
+        el.addEventListener('mousedown', () => clearTimeout(hoverTimer));
         el.addEventListener('dragstart', (e) => {
-            dragNode = node;
             clearTimeout(hoverTimer);
             // a bar button is dragged with the menus closed, a menu row is not:
-            // closing would remove the row itself and break the drag
+            // closing would remove the row itself and break the drag. This runs
+            // before the state below is claimed: closeAll() ends any drag.
             if (el.classList.contains(BTN_CLASS)) closeAll();
+            dragNode = node;
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData(DRAG_MIME, node.id);
-            if (node.url) e.dataTransfer.setData('text/plain', node.url);
+            // text/plain is always set, folders included. DRAG_MIME alone is a
+            // custom type, and a drag carrying nothing the platform recognises
+            // is not reliably started by the OS drag session — which is the one
+            // difference there was between folder rows (custom type only) and
+            // bookmark rows (which also carried their URL), and folder rows
+            // were exactly the ones that would not pick up.
+            e.dataTransfer.setData('text/plain', node.url || titleOf(node));
         });
         el.addEventListener('dragend', endDrag);
     }
+
+    // A drag that dies anywhere else — dropped on Vivaldi's own UI, cancelled
+    // with Escape, ended over a target that never saw the drop — still has to
+    // release the state.
+    //
+    // Bubble phase, deliberately: in capture this runs BEFORE the drop target's
+    // own handler and would clear dragNode out from under it, so every drop
+    // would silently do nothing. Our own targets stop propagation after they
+    // have applied the drop (and call endDrag themselves), so what reaches here
+    // is only the drops that landed on nothing.
+    document.addEventListener('dragend', endDrag);
+    document.addEventListener('drop', endDrag);
 
     // ctx: { node, parentId, axis, openFolder }
     //   node       — the node under the cursor
@@ -1713,7 +2099,7 @@
         }
         // the cursor left "into the folder" for a regular insert-next-to point —
         // cancel the pending auto-open of the previous folder: otherwise it would
-        // fire after the remaining time (up to DRAG_OPEN_DELAY) even though the
+        // fire after the remaining time (up to dragOpenDelay) even though the
         // cursor is no longer over that folder
         clearDragOpenTimer();
         const r = el.getBoundingClientRect();
@@ -1759,7 +2145,7 @@
             // tree must not be opened: it would land in the screen corner on top
             // of everything
             if (el.isConnected) openFolder();
-        }, DRAG_OPEN_DELAY);
+        }, settings.dragOpenDelay);
     }
 
     // ------------------------------------------------------------------
