@@ -1211,7 +1211,10 @@
             closeAll();
             closeEditDialog();
         });
-        window.addEventListener('blur', closeAll);
+        // A native context menu takes the focus away from the UI window, and
+        // the menu the right click came from must survive that — otherwise it
+        // vanishes from under the native menu that is describing its own row.
+        window.addEventListener('blur', () => { if (!nativeMenu) closeAll(); });
         window.addEventListener('resize', () => { closeAll(); fitBar(); });
     }
 
@@ -1660,6 +1663,11 @@
     // ------------------------------------------------------------------
     // Context menu.
     //
+    // The menu itself is normally drawn by the browser, not from here — see
+    // showNativeContextMenu below; what follows is the item list both paths
+    // share, and the HTML menu that stands in when the native one cannot be
+    // shown.
+    //
     // Its contents are deliberately shorter than Vivaldi's native menu: the
     // open and copy-link entries are dropped — a plain click, the middle button
     // and Ctrl/⌘ already cover opening. Editing and deleting are what is left.
@@ -1726,6 +1734,141 @@
         return items;
     }
 
+    // ------------------------------------------------------------------
+    // The native context menu.
+    //
+    // Vivaldi draws its own menus not in HTML but through a private API, and
+    // the result is an OS-drawn window: the platform's own metrics, mnemonics,
+    // keyboard handling and shadow, and no clipping by the browser window. The
+    // call below is the very one Vivaldi's UI makes for its menus, and the item
+    // shape is copied from there:
+    //     children: [ { item: {...}, children: [...] } | { separator: {} } ]
+    // The chosen item does not come back through show()'s callback but through
+    // menubarMenu.onAction, as { id, state: { shift, ctrl, alt, command, left,
+    // right, center }, persistent } — hence the listeners around the call.
+    //
+    // Everything here is a private API, so nothing is assumed: a browser update
+    // may rename or drop it, and showContextMenu() then falls back to the mod's
+    // own HTML menu — which is why that one is kept.
+    // ------------------------------------------------------------------
+    const NATIVE_KEEPALIVE = 2000;      // ms, the interval Vivaldi itself uses
+
+    // Set once the API turns out to be broken rather than merely absent: a
+    // schema change is reported asynchronously, through lastError, so the menu
+    // of that first right click is lost either way — but the next one goes
+    // straight to the HTML menu instead of failing again.
+    let nativeMenuBroken = false;
+    let nativeMenu = null;              // the menu currently on screen, if any
+
+    function nativeMenuApi() {
+        if (nativeMenuBroken) return null;
+        const v = window.vivaldi;
+        if (!v?.contextMenu?.show || !v?.menubarMenu?.onAction) return null;
+        const windowId = Number(window.vivaldiWindowId);
+        if (!Number.isFinite(windowId)) return null;
+        return { v, windowId };
+    }
+
+    // Vivaldi keeps the window from going idle for as long as one of its menus
+    // is up; without it the menu is dismissed from under the user.
+    function startNativeKeepalive(v, windowId) {
+        return setInterval(() => {
+            try {
+                v.utilities?.emulateUserInput?.(windowId);
+            } catch (err) {
+                console.warn('[SlimBookmarks] emulateUserInput failed:', err);
+            }
+        }, NATIVE_KEEPALIVE);
+    }
+
+    function endNativeMenu() {
+        if (!nativeMenu) return;
+        const { v, onOpen, onClose, onAction, keepalive } = nativeMenu;
+        nativeMenu = null;
+        clearInterval(keepalive);
+        v.menubarMenu.onOpen.removeListener(onOpen);
+        v.menubarMenu.onClose.removeListener(onClose);
+        v.menubarMenu.onAction.removeListener(onAction);
+    }
+
+    // items — the same [{ label, run } | null] list the HTML menu is built
+    // from; null is a separator. Returns false when the menu could not be
+    // shown at all, and the caller draws the HTML one instead.
+    function showNativeContextMenu(items, x, y) {
+        const api = nativeMenuApi();
+        if (!api) return false;
+        const { v, windowId } = api;
+
+        // one native menu at a time — the API refuses a second one, and the
+        // listeners of the first would still be armed
+        endNativeMenu();
+
+        const runs = new Map();
+        const children = items.map((item, i) => {
+            if (!item) return { separator: {} };
+            runs.set(i, item.run);
+            return { item: { id: i, name: item.label, type: 'command', enabled: true } };
+        });
+
+        let acted = false;
+        const onOpen = () => {
+            if (!nativeMenu || nativeMenu.keepalive) return;
+            nativeMenu.keepalive = startNativeKeepalive(v, windowId);
+        };
+        const onAction = (action) => {
+            const run = runs.get(action?.id);
+            if (!run) return;   // an action of somebody else's menu
+            acted = true;
+            // the menus the right click came from have served their purpose —
+            // closed before the action so that a dialog opens over a clean bar
+            closeAll();
+            run();
+        };
+        const onClose = () => {
+            endNativeMenu();
+            // the click that dismissed the menu was eaten by the OS and never
+            // reached our document, so the menus underneath have to be closed
+            // from here rather than by the global click handler
+            if (!acted) closeAll();
+        };
+
+        nativeMenu = { v, onOpen, onClose, onAction, keepalive: null };
+        v.menubarMenu.onOpen.addListener(onOpen);
+        v.menubarMenu.onClose.addListener(onClose);
+        v.menubarMenu.onAction.addListener(onAction);
+
+        try {
+            v.contextMenu.show({
+                windowId,
+                documentId: -1,
+                // both as in Vivaldi's own call for a menu opened by the mouse:
+                // the menu unfolds from the cursor, and the browser window is
+                // left to pick the toolkit it draws the menu with
+                forceViews: false,
+                origin: 'pointer',
+                rect: { x: Math.round(x), y: Math.round(y), width: 0, height: 0 },
+                icons: [],
+                children,
+            }, () => {
+                const err = chrome.runtime.lastError;
+                if (!err) return;
+                // the API is there but no longer speaks our schema: give up on
+                // it for the rest of this UI session
+                console.warn('[SlimBookmarks] native context menu refused, falling back to the mod menu:', err.message);
+                nativeMenuBroken = true;
+                endNativeMenu();
+            });
+        } catch (err) {
+            // a synchronous throw is the bindings rejecting our arguments —
+            // there is no menu, so the HTML one can still take this very click
+            console.warn('[SlimBookmarks] native context menu unavailable, using the mod menu:', err);
+            nativeMenuBroken = true;
+            endNativeMenu();
+            return false;
+        }
+        return true;
+    }
+
     // keepDepth — how many already open menus to keep: 0 for a bar button,
     // depth + 1 for a menu row (the row itself must stay on screen).
     function showContextMenu(target, x, y, keepDepth) {
@@ -1733,6 +1876,10 @@
         if (!items.length) return;
         closeFrom(keepDepth);
         clearTimeout(hoverTimer);
+
+        // the native menu is the same list of items in the platform's own
+        // window; the HTML menu below is what is left when it cannot be shown
+        if (showNativeContextMenu(items, x, y)) return;
 
         const menu = makeMenuShell(CTX_DEPTH);
         items.forEach((item) => {
