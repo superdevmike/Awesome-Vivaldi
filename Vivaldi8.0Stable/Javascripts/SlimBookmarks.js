@@ -49,6 +49,53 @@
     const ICONS_NF_CLASS = 'is-icons-no-folders';   // display: icons, except folders
     const FOLDER_BTN_CLASS = 'is-folder';       // marks a bar button that is a folder
     const CHEVRON_CLASS = 'custom-bookmark-bar-chevron';   // the "the rest" button
+    const PREVIEW_CLASS = 'is-preview';         // the bar while the toolbar editor is open
+
+    // Vivaldi's own marker for "a toolbar child that is not a toolbar button".
+    // Two things in the browser key off it, and the bar needs both:
+    //   * Toolbar.getButtonIndex() resolves a Space or a Separator to its index
+    //     by counting the toolbar's DOM children, skipping only
+    //     .window-buttongroup and .biscuit-setting-version. Our bar is a child
+    //     like any other, so without the class every spacer standing after it
+    //     is off by one, and dragging that Space in the toolbar editor moves
+    //     (or deletes) its neighbour instead. Measured in a scratch profile:
+    //     the Space at index 6 resolved to 7, which is the Extensions button.
+    //     This is not specific to customization — Vivaldi also makes its
+    //     buttons draggable while Ctrl is held.
+    //   * The edit-mode "jiggle" animation in common.css lists the same class
+    //     among the elements it leaves alone.
+    // It is an internal class, so it is used here as a marker only: the three
+    // properties common.css hangs on it (display / padding / max-width) are
+    // all overridden in the bar's own rule below. If a future build drops the
+    // class, the bar simply goes back to being counted — everything outside
+    // Vivaldi's own toolbar editor keeps working.
+    const NOT_A_BUTTON_CLASS = 'biscuit-setting-version';
+
+    // ------------------------------------------------------------------
+    // Where the bar stands in the toolbar.
+    //
+    // Vivaldi keeps a toolbar's layout as a plain list of item names in a pref
+    // and renders it with React; our bar is not in that list and never can be
+    // (the renderer is a switch over known names). So React always inserts a
+    // new button before its own next sibling — which means anything the user
+    // adds "after the address field" is rendered *after* our node, never
+    // between the address field and the bar. The bar's own place therefore has
+    // to be ours to decide: it is stored as the name of the toolbar item the
+    // bar stands after, and it is what dragging the bar in customization mode
+    // writes down.
+    // ------------------------------------------------------------------
+    const DEFAULT_ANCHOR = 'AddressField';  // where the bar has always been
+    const ANCHOR_START = '<start>';         // ... or before every toolbar item
+
+    // Vivaldi's own drag types for a toolbar button (bundle.js): the name of
+    // the button, the toolbar it was picked up from and its index there.
+    // Reading them is what lets the bar accept a button dropped onto it.
+    const VIVALDI_BTN_MIME = 'vivaldi/x-button-toolbar';
+    const VIVALDI_TOOLBAR_MIME = 'vivaldi/x-toolbar-name';
+    const VIVALDI_BTN_INDEX_MIME = 'vivaldi/x-button-index';
+    // ... and ours, for dragging the bar itself. Deliberately not Vivaldi's:
+    // its toolbar reads only its own type and leaves this drag alone.
+    const BAR_DRAG_MIME = 'application/x-vivaldi-mod-bookmark-bar';
 
     // When the user picks a custom folder for the bookmark bar, Vivaldi flags
     // it in Bookmarks with meta_info.Bookmarkbar = 'true'. It can sit at any
@@ -117,9 +164,10 @@
         barLabelWidth: 105,     // px, ceiling for one bar button's title
         menuLabelWidth: 300,    // px, ceiling for one menu row's title
         displayMode: 'vivaldi', // vivaldi | titleAndIcon | titleOnly | iconOnly | iconExceptFolders
-        hoverDelay: 120,        // ms, hovering a folder opens its menu
-        dragOpenDelay: 400,     // ms, hovering a folder while dragging opens it
+        hoverDelay: 'medium',       // fast | medium | slow, see DELAY_PRESETS
+        dragOpenDelay: 'medium',    // fast | medium | slow, see DELAY_PRESETS
         barFolderId: '',        // overrides the folder the bar is built from
+        barAnchor: DEFAULT_ANCHOR,  // the toolbar item the bar stands after
     };
 
     // key -> [min, max]. Values are clamped rather than rejected: ModConfig's
@@ -129,10 +177,23 @@
         maxBarWidth: [120, 4000],
         barLabelWidth: [0, 600],
         menuLabelWidth: [80, 1200],
-        hoverDelay: [0, 5000],
-        dragOpenDelay: [0, 10000],
     };
     const DISPLAY_MODES = ['vivaldi', 'titleAndIcon', 'titleOnly', 'iconOnly', 'iconExceptFolders'];
+
+    // The two timings are a choice of three speeds rather than a number of
+    // milliseconds: what the user actually wants to say is "sooner" or "let me
+    // pass over it first", and a free number invited values that made the menus
+    // either impossible to cross or unbearably slow. The medium column is the
+    // value each timing had while it was a number, so the default behaviour is
+    // unchanged. The stored setting is the name; the milliseconds are resolved
+    // at every use through delayOf().
+    const DELAY_SPEEDS = ['fast', 'medium', 'slow'];
+    const DELAY_PRESETS = {
+        hoverDelay: { fast: 50, medium: 120, slow: 300 },
+        dragOpenDelay: { fast: 200, medium: 400, slow: 800 },
+    };
+
+    const delayOf = (key) => DELAY_PRESETS[key][settings[key]] ?? DELAY_PRESETS[key].medium;
 
     // Set by createBookmarkBar once the bar exists. The config may arrive
     // either before or after that — this is the single place both paths meet.
@@ -221,6 +282,35 @@
         }
     }
 
+    // Writing a Vivaldi pref. Only one pref is ever written from here — the
+    // layout of the toolbar the bar lives in, when a button is dropped onto the
+    // bar — and it is written exactly the way Vivaldi's own toolbar editor
+    // writes it. The signature differs between builds (a promise in current
+    // ones, a callback in older), so both are tolerated.
+    function writePref(path, value) {
+        const prefs = prefsApi();
+        if (!prefs || typeof prefs.set !== 'function') return false;
+        const report = (err) => console.warn('[SlimBookmarks] could not write', path, err);
+        try {
+            // current builds take the value alone and answer with a promise;
+            // passing a callback to those is rejected outright ("no matching
+            // signature"), so the one-argument form is tried first
+            let result;
+            try {
+                result = prefs.set({ path, value });
+            } catch {
+                result = prefs.set({ path, value }, () => {
+                    if (chrome.runtime.lastError) report(chrome.runtime.lastError.message);
+                });
+            }
+            if (result && typeof result.catch === 'function') result.catch(report);
+            return true;
+        } catch (err) {
+            report(err);
+            return false;
+        }
+    }
+
     // Re-reads the setting and calls done() in every case. Nothing here may get
     // in the way of opening a bookmark.
     function readOpenInNewTab(done) {
@@ -298,8 +388,14 @@
         if (DISPLAY_MODES.includes(source.displayMode)) {
             settings.displayMode = source.displayMode;
         }
+        Object.keys(DELAY_PRESETS).forEach((key) => {
+            if (DELAY_SPEEDS.includes(source[key])) settings[key] = source[key];
+        });
         if (typeof source.barFolderId === 'string') {
             settings.barFolderId = source.barFolderId.trim();
+        }
+        if (typeof source.barAnchor === 'string' && source.barAnchor.trim()) {
+            settings.barAnchor = source.barAnchor.trim();
         }
     }
 
@@ -312,6 +408,38 @@
             applyModConfig(JSON.parse(await file.text()));
         } catch (err) {
             console.warn('[SlimBookmarks] mod config not loaded, using defaults:', err);
+        }
+    }
+
+    // The one setting the mod writes itself: dragging the bar has to survive a
+    // restart, and there is no way to ask ModConfig to store a value for us.
+    // Read-modify-write of the shared config file, the same way
+    // WorkspaceThemeSwitcher saves its captured default theme. No
+    // vivaldi-mod-config-updated is dispatched afterwards: the value is already
+    // live in `settings`, and the broadcast would make every other mod re-read
+    // its own config for nothing.
+    async function saveBarAnchor(anchor) {
+        try {
+            const root = await navigator.storage.getDirectory();
+            const dir = await root.getDirectoryHandle(MOD_CONFIG_DIR, { create: true });
+            let raw = {};
+            try {
+                const handle = await dir.getFileHandle(MOD_CONFIG_FILE, { create: false });
+                raw = JSON.parse(await (await handle.getFile()).text()) || {};
+            } catch {
+                // no config file yet — the user has never opened the panel
+            }
+            if (!raw.mods || typeof raw.mods !== 'object') raw.mods = {};
+            if (!raw.mods[MOD_CONFIG_KEY] || typeof raw.mods[MOD_CONFIG_KEY] !== 'object') {
+                raw.mods[MOD_CONFIG_KEY] = {};
+            }
+            raw.mods[MOD_CONFIG_KEY].barAnchor = anchor;
+            const handle = await dir.getFileHandle(MOD_CONFIG_FILE, { create: true });
+            const writable = await handle.createWritable();
+            await writable.write(JSON.stringify(raw, null, 2));
+            await writable.close();
+        } catch (err) {
+            console.warn('[SlimBookmarks] could not save the bar position:', err);
         }
     }
 
@@ -386,9 +514,30 @@
             /* the fallbacks are only for the split second before
                applyBarVars() runs — the real values come from the settings */
             max-width: var(--sb-max-bar-width, 600px);
+            /* common.css gives .biscuit-setting-version a padding of its own;
+               display and max-width above already override the rest of it */
+            padding: 0;
             overflow: hidden;
             /* same as the native .bookmark-bar */
             font-size: 11.5px;
+        }
+
+        /* While the toolbar editor is open the bar stays visible but stops
+           acting — Vivaldi turns its own buttons into previews there, and a
+           bookmark menu opening over the editor's dialog would be absurd.
+           The icon opacity is Vivaldi's own value for a preview button
+           (common.css: .button-disabled-preview.button-toolbar > button svg). */
+        /* The bar itself stays hit-testable — it is what the user grabs to move
+           it — while everything inside goes inert, so a folder cannot be opened
+           and a bookmark cannot be dragged out of a bar that is being placed. */
+        .${BAR_CLASS}.${PREVIEW_CLASS} {
+            cursor: grab;
+        }
+        .${BAR_CLASS}.${PREVIEW_CLASS} > * {
+            pointer-events: none;
+        }
+        .${BAR_CLASS}.${PREVIEW_CLASS} .${ICON_CLASS} {
+            opacity: 0.65;
         }
 
         .${BTN_CLASS} {
@@ -943,8 +1092,10 @@
     function createBookmarkBar() {
         const bar = document.createElement('div');
         // no Vivaldi classes: their rules centre the text, impose a min-width
-        // and draw a focus ring — because of them labels got clipped in the middle
-        bar.className = BAR_CLASS;
+        // and draw a focus ring — because of them labels got clipped in the
+        // middle. The one exception is NOT_A_BUTTON_CLASS, which is a marker
+        // rather than a style — see its declaration.
+        bar.className = BAR_CLASS + ' ' + NOT_A_BUTTON_CLASS;
 
         let barButtons = [];    // top-level buttons
         let barFolderId = null; // id of the folder the bar was built from
@@ -1010,7 +1161,7 @@
                         // folder, as in the native bookmark bar
                         if (!openMenus.length || activeBarBtn === btn) return;
                         clearTimeout(hoverTimer);
-                        hoverTimer = setTimeout(() => openBarMenu(btn, item.children || [], item.id), settings.hoverDelay);
+                        hoverTimer = setTimeout(() => openBarMenu(btn, item.children || [], item.id), delayOf('hoverDelay'));
                     });
                 } else {
                     btn.addEventListener('click', (e) => {
@@ -1029,7 +1180,7 @@
                         if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                         if (!openMenus.length) return;
                         clearTimeout(hoverTimer);
-                        hoverTimer = setTimeout(closeAll, settings.hoverDelay);
+                        hoverTimer = setTimeout(closeAll, delayOf('hoverDelay'));
                     });
                 }
 
@@ -1120,6 +1271,164 @@
             fitting = false;
         }
 
+        // ------------------------------------------------------------------
+        // Moving the bar, and taking in Vivaldi's own toolbar buttons.
+        //
+        // Vivaldi's toolbar accepts a dropped button only on top of another
+        // button: everywhere else its onDragOver sets dropEffect 'none', so the
+        // stretch the bar occupies used to swallow every drop without a trace
+        // (measured: dragging a button onto the bar left the layout pref
+        // untouched). Both halves of the problem live here — the bar takes such
+        // a drop itself and rewrites the layout pref the way the editor would,
+        // and the bar can be dragged to a new place in customization mode.
+        // ------------------------------------------------------------------
+        let barDragging = false;
+
+        // The pref the toolbar keeps its layout in. It is a prop of Vivaldi's
+        // own Toolbar component, so it comes off the React fiber. Without it the
+        // drop is not touched at all: Vivaldi's own behaviour beats writing to a
+        // guessed pref path.
+        function toolbarPrefName(toolbar) {
+            try {
+                const key = Object.keys(toolbar).find(k => k.startsWith('__reactFiber$'));
+                let fiber = key ? toolbar[key] : null;
+                while (fiber && !fiber.stateNode?.editToolbar) fiber = fiber.return;
+                return fiber?.stateNode?.props?.name || null;
+            } catch (err) {
+                console.warn('[SlimBookmarks] could not read the toolbar pref name:', err);
+                return null;
+            }
+        }
+
+        const isButtonDrag = (e) => !!e.dataTransfer
+            && Array.from(e.dataTransfer.types).includes(VIVALDI_BTN_MIME);
+
+        // The children the bar can stand between: the named ones only, since
+        // the anchor is stored as a name. An unnamed child (the extensions
+        // container) is not a stop of its own — a drop past it anchors to the
+        // last named item before it.
+        function anchorCandidates() {
+            const toolbar = bar.parentElement;
+            if (!toolbar) return [];
+            return Array.from(toolbar.children).filter(el =>
+                el !== bar && toolbarItemName(el) && el.getBoundingClientRect().width > 0);
+        }
+
+        // The item an insertion at this x lands after, or null for "first".
+        function slotBefore(x) {
+            let after = null;
+            for (const el of anchorCandidates()) {
+                const r = el.getBoundingClientRect();
+                if (x >= r.left + r.width / 2) after = el; else break;
+            }
+            return after;
+        }
+
+        function showSlotFeedback(x) {
+            const target = slotBefore(x);
+            if (target) { showDropFeedback(target, { after: true }, 'x'); return; }
+            const first = anchorCandidates()[0];
+            if (first) showDropFeedback(first, { after: false }, 'x');
+        }
+
+        // A Vivaldi button dropped on the bar. The insertion index is the same
+        // for both halves of the bar — right after the bar's own anchor — and
+        // what differs is where the bar ends up standing: a drop on the left
+        // half means the button goes between the anchor and the bar, which is
+        // exactly "the bar now stands after this button".
+        function takeButtonDrop(e, before) {
+            const toolbar = bar.parentElement;
+            if (!toolbar) return false;
+            // Everything the drag carries is read right here, while the event is
+            // still being dispatched: a DataTransfer goes empty the moment the
+            // handler returns, and the layout below is fetched asynchronously.
+            const name = e.dataTransfer.getData(VIVALDI_BTN_MIME);
+            const from = e.dataTransfer.getData(VIVALDI_TOOLBAR_MIME);
+            const at = parseInt(e.dataTransfer.getData(VIVALDI_BTN_INDEX_MIME), 10);
+            if (!name) return false;
+            const pref = toolbarPrefName(toolbar);
+            if (!pref) return false;
+            // A button dragged in from another toolbar: Vivaldi drops it from
+            // its old toolbar in its own dragend, and only when its own drop
+            // handler has run. Swallowing that drop would leave a duplicate
+            // behind, so those are left to Vivaldi.
+            if (from && from !== pref) return false;
+
+            readPref(pref, (value) => {
+                if (!Array.isArray(value)) return;
+                const list = value.slice();
+                // A move inside this toolbar. The source index is what tells the
+                // old place apart from a brand-new button of the same name —
+                // the spacers and the separator may legitimately repeat, so the
+                // name alone is not enough to find what to remove.
+                if (Number.isInteger(at) && list[at] === name) list.splice(at, 1);
+
+                const anchor = settings.barAnchor || DEFAULT_ANCHOR;
+                const found = anchor === ANCHOR_START ? -1 : list.indexOf(anchor);
+                const index = anchor === ANCHOR_START ? 0 : (found >= 0 ? found + 1 : list.length);
+                list.splice(index, 0, name);
+                writePref(pref, list);
+                // A drop on the left half moves the bar behind the button. Its
+                // node usually does not exist yet — React renders it once the
+                // pref change lands — and then insertBar() finds nothing and
+                // leaves the bar where it is; the observer over the toolbar's
+                // children puts it in place as soon as the node shows up. When
+                // the button was already in this toolbar the node is there and
+                // the bar moves at once.
+                if (before) {
+                    settings.barAnchor = name;
+                    insertBar(bar);
+                    fitBar();
+                    saveBarAnchor(name);
+                }
+            });
+            return true;
+        }
+
+        bar.addEventListener('dragstart', (e) => {
+            // the bar itself only, and only where toolbar items are arranged —
+            // a bookmark dragged out of a bar button brings its own dragstart
+            if (e.target !== bar || !bar.draggable) return;
+            e.stopPropagation();
+            barDragging = true;
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData(BAR_DRAG_MIME, '1');
+            // as for bookmarks: a drag carrying nothing the platform recognises
+            // is not reliably started by the OS drag session
+            e.dataTransfer.setData('text/plain', 'Slim Bookmarks');
+        });
+        bar.addEventListener('dragend', () => {
+            if (!barDragging) return;
+            barDragging = false;
+            clearDropFeedback();
+        });
+
+        // The bar is dropped onto the toolbar, so the feedback and the drop
+        // itself hang on the toolbar. Both are attached on every (re-)insertion
+        // of the bar; a repeated addEventListener with the same function is a
+        // no-op, so they never pile up.
+        function onToolbarDragOver(e) {
+            if (!barDragging) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = 'move';
+            showSlotFeedback(e.clientX);
+        }
+        function onToolbarDrop(e) {
+            if (!barDragging) return;
+            e.preventDefault();
+            e.stopPropagation();
+            barDragging = false;
+            clearDropFeedback();
+            const target = slotBefore(e.clientX);
+            const anchor = target ? toolbarItemName(target) : ANCHOR_START;
+            if (!anchor || anchor === settings.barAnchor) return;
+            settings.barAnchor = anchor;
+            insertBar(bar);
+            fitBar();
+            saveBarAnchor(anchor);
+        }
+
         // A right click on the free space between/after the buttons = the
         // context menu of the bar folder itself, so that a new folder can be
         // added to the top level of the bar. An event from a button never
@@ -1135,6 +1444,18 @@
         // the bar folder. An event from a button never reaches here: there is a
         // stopPropagation over there.
         bar.addEventListener('dragover', (e) => {
+            if (isButtonDrag(e)) {
+                // Vivaldi's own toolbar button. The bar takes the drop rather
+                // than letting it fall through to the toolbar, which refuses
+                // everything outside its buttons; the line shows which side of
+                // the bar the button will land on.
+                e.preventDefault();
+                e.stopPropagation();
+                e.dataTransfer.dropEffect = 'move';
+                const r = bar.getBoundingClientRect();
+                showDropFeedback(bar, { after: e.clientX >= r.left + r.width / 2 }, 'x');
+                return;
+            }
             if (!dragNode || !barFolderId) return;
             const dest = { parentId: barFolderId };
             if (!canDrop(dragNode, dest)) return;
@@ -1145,6 +1466,18 @@
             showDropFeedback(bar, { parentId: barFolderId, index: barItems.length, after: true }, 'x');
         });
         bar.addEventListener('drop', (e) => {
+            if (isButtonDrag(e)) {
+                const r = bar.getBoundingClientRect();
+                // takeButtonDrop declines what it must not touch (a button from
+                // another toolbar); then the event is left to bubble on to
+                // Vivaldi's own handler untouched
+                if (takeButtonDrop(e, e.clientX < r.left + r.width / 2)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+                clearDropFeedback();
+                return;
+            }
             e.preventDefault();
             // the drop location is recomputed from this very drop event: the
             // cursor may have last been over another element
@@ -1175,7 +1508,7 @@
             if (ctxMenu || dragNode) return;
             if (!openMenus.length || activeBarBtn === chevron) return;
             clearTimeout(hoverTimer);
-            hoverTimer = setTimeout(() => openBarMenu(chevron, hiddenItems, barFolderId), settings.hoverDelay);
+            hoverTimer = setTimeout(() => openBarMenu(chevron, hiddenItems, barFolderId), delayOf('hoverDelay'));
         });
         bar.appendChild(chevron);
 
@@ -1189,9 +1522,24 @@
         // the very first one — possibly attached to a parent already detached
         // from the document — would be considered current.
         const resizeObserver = new ResizeObserver(fitBar);
+        // React rebuilds the toolbar's own children on every layout change, and
+        // our node keeps whatever position it had — which after a rearrangement
+        // may no longer be the one next to the anchor. This puts it back, and it
+        // is also what moves the bar to a button that has just been dropped on
+        // it. Our own insertion mutates the child list too, but by then the bar
+        // is anchored and insertBar() does nothing, so it settles in one pass.
+        const anchorObserver = new MutationObserver(() => {
+            if (bar.isConnected && !barIsAnchored(bar)) { insertBar(bar); fitBar(); }
+        });
         const rewatchParent = () => {
             resizeObserver.disconnect();
-            if (bar.parentElement) resizeObserver.observe(bar.parentElement);
+            anchorObserver.disconnect();
+            const toolbar = bar.parentElement;
+            if (!toolbar) return;
+            resizeObserver.observe(toolbar);
+            anchorObserver.observe(toolbar, { childList: true });
+            toolbar.addEventListener('dragover', onToolbarDragOver);
+            toolbar.addEventListener('drop', onToolbarDrop);
         };
         rewatchParent();
         // after every re-insertion of the bar (leaving toolbar customization
@@ -1243,6 +1591,8 @@
         onSettingsChanged = () => {
             applyBarVars();
             closeAll();
+            // the position may have been typed into the panel by hand
+            insertBar(bar);
             load();
         };
 
@@ -1293,16 +1643,58 @@
             || null;
     }
 
+    // A toolbar item is a direct child of the toolbar. Its name sits on the
+    // element carrying data-name, which is the child itself for the address
+    // field and the inner <button> for a button. Some children have no name at
+    // all (the extensions container), and those cannot serve as an anchor.
+    function toolbarItemName(child) {
+        if (child.dataset && child.dataset.name) return child.dataset.name;
+        return child.querySelector?.('[data-name]')?.dataset.name || null;
+    }
+
+    function toolbarItemNode(toolbar, name) {
+        for (const child of toolbar.children) {
+            if (toolbarItemName(child) === name) return child;
+        }
+        return null;
+    }
+
+    // What must stand immediately before the bar. Three answers, and they are
+    // three different placements:
+    //   a toolbar child — the bar goes right after it;
+    //   null           — the anchor is ANCHOR_START, the bar comes first;
+    //   undefined      — nothing in this toolbar carries a name the anchor
+    //                    could refer to, so the bar goes to the end, which is
+    //                    where it went before its position became a setting.
+    // A named-but-missing anchor falls back to the address field: the user may
+    // have dragged the item the bar was anchored to out of the toolbar.
+    function barPredecessor(toolbar) {
+        const wanted = settings.barAnchor || DEFAULT_ANCHOR;
+        if (wanted === ANCHOR_START) return null;
+        return toolbarItemNode(toolbar, wanted)
+            || toolbarItemNode(toolbar, DEFAULT_ANCHOR)
+            || undefined;
+    }
+
+    function barIsAnchored(bar) {
+        const toolbar = bar.parentElement;
+        if (!toolbar) return false;
+        const before = barPredecessor(toolbar);
+        if (before === undefined) return bar.nextElementSibling === null;
+        return bar.previousElementSibling === before;
+    }
+
     function insertBar(bar) {
         const toolbar = findToolbar();
         if (!toolbar) return false;
-
-        const addressField = toolbar.querySelector('.UrlBar-AddressField');
-        if (addressField && addressField.nextSibling) {
-            toolbar.insertBefore(bar, addressField.nextSibling);
-        } else {
-            toolbar.appendChild(bar);
-        }
+        // already where it belongs — say so without touching the DOM: this also
+        // runs from a MutationObserver on the toolbar, and a pointless move
+        // would wake that observer again
+        if (bar.parentElement === toolbar && barIsAnchored(bar)) return true;
+        const before = barPredecessor(toolbar);
+        if (before === undefined) toolbar.appendChild(bar);
+        else if (before === null) toolbar.insertBefore(bar, toolbar.firstChild);
+        else toolbar.insertBefore(bar, before.nextSibling);
         return true;
     }
 
@@ -1317,23 +1709,28 @@
         const isEditing = () => root.classList.contains('toolbar-edit-mode');
 
         const sync = () => {
-            if (isEditing()) {
-                if (bar.isConnected) {
-                    closeAll();
-                    bar.remove();
-                }
-                return;
-            }
-            // leaving the mode repaints the toolbar, and our insertion may be
-            // wiped by the next render — hence a couple of extra attempts. After
-            // every (including deferred) successful insertion, onInserted()
-            // recomputes which buttons fit and moves the ResizeObserver to the
-            // current parent — without that the bar stays in a state computed for
-            // the previous size after leaving customization mode, until the user
-            // touches the window manually
+            // The bar used to be removed for the duration of customization mode.
+            // It stays now: the mode shows the toolbar as it really is, and a
+            // bar that vanishes exactly while its place is being arranged is the
+            // opposite of that. What it must not do there is act — Vivaldi turns
+            // its own buttons into inert previews, so the bar follows (see
+            // PREVIEW_CLASS in the stylesheet), and any open menu is closed.
+            const editing = isEditing();
+            bar.classList.toggle(PREVIEW_CLASS, editing);
+            // customization mode is where toolbar items are moved, so that is
+            // where the bar itself can be picked up — and nowhere else
+            bar.draggable = editing;
+            if (editing) closeAll();
+            // entering and leaving the mode repaints the toolbar, and our
+            // insertion may be wiped by the next render — hence a couple of
+            // extra attempts. After every (including deferred) successful
+            // insertion, onInserted() recomputes which buttons fit and moves the
+            // ResizeObserver to the current parent — without that the bar stays
+            // in a state computed for the previous size, until the user touches
+            // the window manually
             if (!bar.isConnected && insertBar(bar)) onInserted();
             [200, 600].forEach(delay => setTimeout(() => {
-                if (!isEditing() && !bar.isConnected && insertBar(bar)) onInserted();
+                if (!bar.isConnected && insertBar(bar)) onInserted();
             }, delay));
         };
 
@@ -1620,14 +2017,19 @@
                     if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
                     setRowActive(row, true);
                     clearTimeout(hoverTimer);
-                    hoverTimer = setTimeout(openSub, settings.hoverDelay);
+                    hoverTimer = setTimeout(openSub, delayOf('hoverDelay'));
                 };
                 row.addEventListener('click', (e) => {
                     e.stopPropagation();
                     clearTimeout(hoverTimer);
-                    // a second click on a folder whose submenu is open closes
-                    // that submenu instead of leaving it standing
-                    if (openMenus[depth + 1]?._ownerRow === row) { closeFrom(depth + 1); return; }
+                    // Deliberately not a toggle. Only the folders on the bar
+                    // itself close on a second click: there the button stays put
+                    // under the cursor, so clicking it again reads as "put this
+                    // away". A row inside a menu is a step along a path — the
+                    // submenu the user is heading into may well be covering the
+                    // row they just clicked, and collapsing the path under the
+                    // cursor there loses their place. openSub() bails out on its
+                    // own when this row's submenu is already open.
                     openSub();
                 });
             } else {
@@ -1636,7 +2038,7 @@
                     setRowActive(row, true);
                     clearTimeout(hoverTimer);
                     // hovering a bookmark -> close the neighbouring folder's submenu
-                    hoverTimer = setTimeout(() => closeFrom(depth + 1), settings.hoverDelay);
+                    hoverTimer = setTimeout(() => closeFrom(depth + 1), delayOf('hoverDelay'));
                 };
                 row.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -2315,7 +2717,7 @@
         }
         // the cursor left "into the folder" for a regular insert-next-to point —
         // cancel the pending auto-open of the previous folder: otherwise it would
-        // fire after the remaining time (up to dragOpenDelay) even though the
+        // fire after the remaining time (up to the drag-open delay) even though the
         // cursor is no longer over that folder
         clearDragOpenTimer();
         const r = el.getBoundingClientRect();
@@ -2361,7 +2763,7 @@
             // tree must not be opened: it would land in the screen corner on top
             // of everything
             if (el.isConnected) openFolder();
-        }, settings.dragOpenDelay);
+        }, delayOf('dragOpenDelay'));
     }
 
     // ------------------------------------------------------------------
