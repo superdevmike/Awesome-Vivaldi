@@ -880,6 +880,21 @@
     let hoverTimer = null;
     let activeBarBtn = null;
 
+    // Reopening the menus after a reload.
+    //
+    // Every bookmark change — including the move our own drop just made — comes
+    // back as an onMoved/onChildrenReordered event, and the bar answers it with
+    // closeAll() + load(): the whole stack of menus vanishes from under the
+    // cursor right after a successful drag. So before the move is sent the open
+    // path is written down, and the freshly rendered bar reopens it.
+    // Only a drop fills this in: a change made anywhere else (the bookmark
+    // manager, another window) still closes the menus, as it did before.
+    // The two functions are the bar's own — they need its buttons — and are
+    // installed here by createBookmarkBar.
+    let captureMenuPath = () => null;
+    let restoreMenuPath = () => {};
+    let pendingMenuPath = null;
+
     // A menu holding a live drag source is never closed: removing the node the
     // drag started from kills the drag, and the user is left holding nothing.
     // The loop stops at that menu rather than skipping it — the menus above it
@@ -896,6 +911,11 @@
             const menu = openMenus.pop();
             if (menu === ctxMenu) ctxMenu = null;
             menu.remove();
+            // The row this submenu belonged to keeps its highlight while the
+            // submenu is open (see ownsOpenSubmenu), so it has to be released
+            // here — unless the cursor is standing on that very row, where the
+            // ordinary hover highlight is the correct state.
+            if (menu._ownerRow && !menu._ownerRow.matches(':hover')) setRowActive(menu._ownerRow, false);
         }
         if (!openMenus.length && activeBarBtn) {
             activeBarBtn.classList.remove(OPEN_CLASS);
@@ -979,8 +999,9 @@
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         clearTimeout(hoverTimer);
-                        // clicking an already open folder does nothing: neither
-                        // closing nor rebuilding — the menu simply stays
+                        // a second click on the folder that is already open
+                        // closes it, the way the native bookmark bar does
+                        if (activeBarBtn === btn) { closeAll(); return; }
                         openBarMenu(btn, item.children || [], item.id);
                     });
                     btn.addEventListener('mouseenter', () => {
@@ -1030,6 +1051,37 @@
             activeBarBtn = btn;
             btn.classList.add(OPEN_CLASS);
         }
+
+        // The open path as folder ids: the bar button's folder first, then one
+        // id per submenu. Ids rather than elements — render() replaces every
+        // button and every row, so nothing captured here survives the reload.
+        captureMenuPath = () => {
+            if (!openMenus.length || !activeBarBtn) return null;
+            return {
+                chevron: activeBarBtn === chevron,
+                ids: openMenus.map(m => m.dataset.folderId || ''),
+            };
+        };
+
+        // Walks the captured path down the rebuilt bar. Any step that no longer
+        // exists (the folder was dropped into another one, the button moved
+        // under the chevron) simply ends the walk: whatever was reopened stays,
+        // and the rest is gone — which is exactly what the tree now looks like.
+        restoreMenuPath = (path) => {
+            if (!path || !path.ids.length) return;
+            const btn = path.chevron ? chevron : barButtons.find(b => b._node?.id === path.ids[0]);
+            if (!btn || btn.hidden) return;
+            if (path.chevron) openBarMenu(chevron, hiddenItems, barFolderId);
+            else openBarMenu(btn, btn._node.children || [], btn._node.id);
+
+            for (let depth = 1; depth < path.ids.length; depth++) {
+                const menu = openMenus[depth - 1];
+                if (!menu) return;
+                const row = [...menu.children].find(el => el._node?.id === path.ids[depth]);
+                if (!row || !row._openSub) return;
+                row._openSub();
+            }
+        };
 
         // Fitting the bar into its ceiling. The only lever is which buttons
         // stay: the ones that do not fit move under the chevron, from the end.
@@ -1116,6 +1168,7 @@
         chevron.addEventListener('click', (e) => {
             e.stopPropagation();
             clearTimeout(hoverTimer);
+            if (activeBarBtn === chevron) { closeAll(); return; }   // a second click closes it
             openBarMenu(chevron, hiddenItems, barFolderId);
         });
         chevron.addEventListener('mouseenter', () => {
@@ -1158,6 +1211,11 @@
                 console.log('📚 [SlimBookmarks] Bar folder:', folder?.id, folder?.title);
                 barFolderId = folder?.id || null;
                 render(folder?.children || []);
+                // after render: the buttons the path is walked through exist
+                // only now, and fitBar has already decided which of them stayed
+                const path = pendingMenuPath;
+                pendingMenuPath = null;
+                if (path) restoreMenuPath(path);
             });
         }
 
@@ -1397,6 +1455,13 @@
         if (fg) row.style.color = fg;
     }
 
+    // A folder row whose submenu is open keeps its highlight even though the
+    // cursor has left it: while the user is inside the submenu, that row is the
+    // path they took to get there, and without the highlight the trail through
+    // the nested folders disappears. The highlight is released in closeFrom(),
+    // when the submenu goes away.
+    const ownsOpenSubmenu = (row) => openMenus.some((m) => m._ownerRow === row);
+
     // Highlighting follows the actual cursor position rather than a chain of
     // mouseenter events: the menu often appears underneath an already stationary
     // cursor, and then no row-entered event arrives at all.
@@ -1404,7 +1469,7 @@
         menu.addEventListener('mousemove', (e) => {
             const row = e.target.closest ? e.target.closest('.' + ROW_CLASS) : null;
             menu.querySelectorAll('.' + ROW_CLASS + '.' + ACTIVE_CLASS)
-                .forEach((other) => { if (other !== row) setRowActive(other, false); });
+                .forEach((other) => { if (other !== row && !ownsOpenSubmenu(other)) setRowActive(other, false); });
             if (row) setRowActive(row, true);
         });
     }
@@ -1491,7 +1556,7 @@
     function makeMenuRow() {
         const row = document.createElement('div');
         row.className = ROW_CLASS;
-        row.onmouseleave = () => setRowActive(row, false);
+        row.onmouseleave = () => { if (!ownsOpenSubmenu(row)) setRowActive(row, false); };
         return row;
     }
 
@@ -1513,6 +1578,7 @@
             const row = makeMenuRow();
 
             const isFolder = !item.url;
+            row._node = item;   // the node id is how a reopened menu finds this row again
             row.append(makeIcon(item), makeLabel(item, settings.menuLabelWidth));
             row.title = item.url || titleOf(item);
             row.addEventListener('contextmenu', (e) => {
@@ -1543,8 +1609,12 @@
                     getLayer().appendChild(sub);
                     openMenus.push(sub);
                     positionSub(sub, row, menu);
+                    // hovering has already done this, but a submenu reopened
+                    // after a drop has seen no mouseenter at all
+                    if (!dragNode) setRowActive(row, true);
                 };
                 openSubForDrag = openSub;
+                row._openSub = openSub;
 
                 row.onmouseenter = () => {
                     if (ctxMenu || dragNode) return;    // the context menu and a live drag keep focus
@@ -1555,6 +1625,9 @@
                 row.addEventListener('click', (e) => {
                     e.stopPropagation();
                     clearTimeout(hoverTimer);
+                    // a second click on a folder whose submenu is open closes
+                    // that submenu instead of leaving it standing
+                    if (openMenus[depth + 1]?._ownerRow === row) { closeFrom(depth + 1); return; }
                     openSub();
                 });
             } else {
@@ -2216,6 +2289,9 @@
         // to the end of the folder, and an undefined in the object fails
         // chrome.* validation
         if (typeof dest.index === 'number') dst.index = dest.index;
+        // written down before the move: the reload it sets off closes the menus,
+        // and the path has to be read while they are still open
+        pendingMenuPath = captureMenuPath();
         chrome.bookmarks.move(node.id, dst, reportError);
     }
 
